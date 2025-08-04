@@ -20,6 +20,8 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.utils import (
     divide,
+    get_pg_rank,
+    get_pg_size,
     get_tensor_model_parallel_group_if_none,
     is_torch_min_version,
     make_tp_sharded_tensor_for_checkpoint,
@@ -47,6 +49,7 @@ except ImportError:
 
 try:
     import transformer_engine  # pylint: disable=unused-import
+    from transformer_engine.pytorch.module.base import get_dummy_wgrad
 
     HAVE_TE = True
 except ImportError:
@@ -219,7 +222,7 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         (self.vocab_start_index, self.vocab_end_index) = (
             VocabUtility.vocab_range_from_global_vocab_size(
-                self.num_embeddings, self.tp_group.rank(), self.tp_group.size()
+                self.num_embeddings, get_pg_rank(self.tp_group), get_pg_size(self.tp_group)
             )
         )
         self.num_embeddings_per_partition = self.vocab_end_index - self.vocab_start_index
@@ -241,8 +244,8 @@ class VocabParallelEmbedding(torch.nn.Module):
                     0,
                     init_method,
                     params_dtype=config.params_dtype,
-                    rank=self.tp_group.rank(),
-                    world_size=self.tp_group.size(),
+                    rank=get_pg_rank(self.tp_group),
+                    world_size=get_pg_size(self.tp_group),
                 )
         else:
             self.weight = Parameter(
@@ -566,19 +569,29 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 # dummy grad_weight tensor to prevent backward hooks from being run
                 # in a background thread.
                 if getattr(weight, "zero_out_wgrad", False):
-                    grad_weight = torch.zeros(
-                        weight.main_grad.shape,
-                        dtype=input.dtype,
-                        device=torch.cuda.current_device(),
-                        requires_grad=False,
-                    )
+                    if HAVE_TE:
+                        # get_dummy_wgrad function in TE enables reuse of single dummy wgrad buffer
+                        # across different layers/microbatches. The function accepts shape as list.
+                        grad_weight = get_dummy_wgrad(
+                            list(weight.main_grad.shape), input.dtype, zero=True
+                        )
+                    else:
+                        grad_weight = torch.zeros(
+                            weight.main_grad.shape,
+                            dtype=input.dtype,
+                            device=torch.cuda.current_device(),
+                            requires_grad=False,
+                        )
                 else:
-                    grad_weight = torch.empty(
-                        weight.main_grad.shape,
-                        dtype=input.dtype,
-                        device=torch.cuda.current_device(),
-                        requires_grad=False,
-                    )
+                    if HAVE_TE:
+                        grad_weight = get_dummy_wgrad(list(weight.main_grad.shape), input.dtype)
+                    else:
+                        grad_weight = torch.empty(
+                            weight.main_grad.shape,
+                            dtype=input.dtype,
+                            device=torch.cuda.current_device(),
+                            requires_grad=False,
+                        )
                 weight.grad_added_to_main_grad = True
             else:
                 grad_weight = None
@@ -808,8 +821,8 @@ class ColumnParallelLinear(torch.nn.Module):
         self.tp_group = get_tensor_model_parallel_group_if_none(
             self.tp_group, is_expert=self.is_expert
         )
-        world_size = self.tp_group.size()
-        rank = self.tp_group.rank()
+        world_size = get_pg_size(self.tp_group)
+        rank = get_pg_rank(self.tp_group)
         self.explicit_expert_comm = self.is_expert and (world_size > 1 or self.expert_parallel)
         self.output_size_per_partition = divide(output_size, world_size)
 
@@ -1120,8 +1133,8 @@ class RowParallelLinear(torch.nn.Module):
             self.tp_group, is_expert=self.is_expert
         )
 
-        world_size = self.tp_group.size()
-        rank = self.tp_group.rank()
+        world_size = get_pg_size(self.tp_group)
+        rank = get_pg_rank(self.tp_group)
         self.explicit_expert_comm = self.is_expert and (world_size > 1 or self.expert_parallel)
 
         self.input_size_per_partition = divide(input_size, world_size)

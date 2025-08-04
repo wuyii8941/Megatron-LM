@@ -39,6 +39,8 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from megatron.core.utils import (
+    get_pg_rank,
+    get_pg_size,
     get_te_version,
     get_tensor_model_parallel_group_if_none,
     is_te_min_version,
@@ -228,8 +230,7 @@ class TELinear(te.pytorch.Linear):
             assert tp_group is None, "duplicated linear should not have tp_group set"
             tp_size = 1
         else:
-            assert tp_group is not None, "Parallel linear should always have tp_group set"
-            tp_size = tp_group.size()
+            tp_size = get_pg_size(tp_group)
 
         self.expert_parallel = self.config.expert_model_parallel_size > 1
         if is_expert:
@@ -374,8 +375,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         self.is_first_microbatch = True
         self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
         extra_kwargs = _get_extra_te_kwargs(config)
-        self.tp_size = tp_group.size()
-        self.tp_rank = tp_group.rank()
+        self.tp_size = get_pg_size(tp_group)
+        self.tp_rank = get_pg_rank(tp_group)
 
         if self.config.delay_wgrad_compute:
             if is_te_min_version("2.3.0"):
@@ -542,8 +543,8 @@ class TEColumnParallelLinear(TELinear):
         if gather_output:
             raise ValueError("Transformer Engine linear layers do not support gather_output = True")
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
-        world_size = tp_group.size()
-        rank = tp_group.rank()
+        world_size = get_pg_size(tp_group)
+        rank = get_pg_rank(tp_group)
 
         super().__init__(
             input_size=input_size,
@@ -657,8 +658,8 @@ class TERowParallelLinear(TELinear):
             tp_group=tp_group,
         )
         if config.use_cpu_initialization:
-            world_size = tp_group.size()
-            rank = tp_group.rank()
+            world_size = get_pg_size(tp_group)
+            rank = get_pg_rank(tp_group)
             input_size_per_partition = divide(input_size, world_size)
             self.master_weight = _initialize_affine_weight_cpu(
                 self.weight,
@@ -888,25 +889,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             if packed_seq_params is not None
             else {}
         )
-        # overwrite self.qkv_format depending on self.config.apply_rope_fusion, which can be set
-        # after init
-        if self.config.apply_rope_fusion and is_te_min_version("0.13.0", check_equality=False):
-            self.qkv_format = "bshd"
-
-        qkv_format = packed_seq_kwargs.get("qkv_format", self.qkv_format)
-
-        # WAR for peak memory usage.
-        # See https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/merge_requests/2388
-        if self.config.apply_rope_fusion and qkv_format == "bshd":
-            query, key, value = [x.transpose(0, 1).contiguous() for x in (query, key, value)]
-            # In PyTorch, the following two tensors are in fact the same:
-            #   Tensor with shape (1, S, H, D) and stride (S*H*D, H*D, D, 1)
-            #   Tensor with shape (1, S, H, D) and stride (H*D, H*D, D, 1)
-            # Stride for a dimension that is 1 has no meaning, so tensors created two different ways
-            # can have same shape but different strides.
-            # We unify them to the first one to pass the stride check in TE
-            if value.shape == key.shape and value.shape[0] == 1 and value.stride() != key.stride():
-                value = value.as_strided(value.shape, key.stride())
+        qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
 
         attention_bias_kwargs = {}
         if attention_bias is not None:
@@ -941,10 +924,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 query, key, value, attention_mask, **attention_bias_kwargs, **packed_seq_kwargs
             )
 
-        if self.config.apply_rope_fusion and qkv_format == "bshd":
-            return core_attn_out.transpose(0, 1)
-        else:
-            return core_attn_out
+        return core_attn_out
 
 
 if HAVE_TE and is_te_min_version("1.9.0.dev0"):
@@ -1003,7 +983,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             # The comms between TP and EP group is explicitly handled by MoE token dispatcher.
             # So we disable comms by making TE agnostic of model parallel.
             tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
-            tp_size = tp_group.size()
+            tp_size = get_pg_size(tp_group)
 
             self.explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
 
@@ -1632,10 +1612,8 @@ try:
         else:
             if interleaved:
                 raise ValueError("Only TE >= 2.3.0 supports interleaved fused RoPE.")
-            if is_te_min_version("1.4.0.dev0"):
-                return apply_rotary_pos_emb(t, freqs, tensor_format="sbhd", fused=True)
-            else:
-                raise ValueError("Only TE >= 1.4.0.dev0 supports fused RoPE.")
+
+            return apply_rotary_pos_emb(t, freqs, tensor_format="sbhd", fused=True)
 
     def fused_apply_rotary_pos_emb_thd(
         t: torch.Tensor,
@@ -1658,6 +1636,7 @@ try:
                 cp_rank=cp_rank,
             )
         else:
+            assert cp_size == 1, "Only TE >= 1.12 supports RoPE fusion for THD format with CP."
             return apply_rotary_pos_emb(
                 t, freqs, tensor_format="thd", fused=True, cu_seqlens=cu_seqlens
             )

@@ -401,6 +401,9 @@ def deprecate_inference_params(inference_context, inference_params):
 def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_initialized=True):
     """Issue a deprecation warning if tp_group is None and return the default tp group."""
     # TODO(zijiey): remove this function later.
+    if not torch.distributed.is_initialized():
+        return None
+
     if tp_group is None:
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             warnings.warn(
@@ -1850,9 +1853,9 @@ def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
                     val.shape[seq_dim] // (2 * cp_size),
                     *val.shape[(seq_dim + 1) :],
                 )
-                index = torch.tensor(
-                    [cp_rank, (2 * cp_size - cp_rank - 1)], device="cpu", pin_memory=True
-                ).cuda(non_blocking=True)
+                index = torch.zeros(2, dtype=torch.int64, device=val.device)
+                index[0].fill_(cp_rank)
+                index[1].fill_(2 * cp_size - cp_rank - 1)
                 val = val.index_select(seq_dim, index)
                 val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
                 batch[key] = val
@@ -1987,3 +1990,27 @@ def nvtx_decorator(message: Optional[str] = None, color: Optional[str] = None):
         return func
 
     return decorator
+
+
+def unwrap_model(model, module_instances=None):
+    """Unwrap_model to return the final model instance"""
+    if module_instances is None:
+        from megatron.core.distributed import DistributedDataParallel as DDP
+        from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
+        from megatron.core.distributed.custom_fsdp import FullyShardedDataParallel as custom_FSDP
+        from megatron.core.transformer.module import Float16Module
+
+        module_instances = (DDP, torch_FSDP, custom_FSDP, Float16Module)
+
+    return_list = True
+    if not isinstance(model, list):
+        model = [model]
+        return_list = False
+    unwrapped_model = []
+    for model_module in model:
+        while isinstance(model_module, module_instances):
+            model_module = model_module.module
+        unwrapped_model.append(model_module)
+    if not return_list:
+        return unwrapped_model[0]
+    return unwrapped_model
