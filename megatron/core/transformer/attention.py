@@ -579,6 +579,13 @@ class Attention(MegatronModule, ABC):
         )
         if no_rope:
             rotary_pos_emb = None
+        #0731 增加
+        debug = hasattr(self, 'layer_number') and self.layer_number == 1
+        if debug:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if rank in [0, 1]:
+                print(f"\n[ATTN L{self.layer_number}] Rank {rank}")
+                print(f"  IN: {hidden_states.sum().item():.6f}")
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -605,6 +612,11 @@ class Attention(MegatronModule, ABC):
         nvtx_range_push(suffix="qkv")
         query, key, value = self.get_query_key_value_tensors(hidden_states, key_value_states)
         nvtx_range_pop(suffix="qkv")
+        # 调试QKV
+        if debug:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if rank in [0, 1]:
+                print(f"  QKV: Q={query.sum().item():.6f}, K={key.sum().item():.6f}, V={value.sum().item():.6f}")
 
         # ===================================================
         # Adjust key, value, and rotary_pos_emb for inference
@@ -719,7 +731,11 @@ class Attention(MegatronModule, ABC):
         # core attention computation
         # ==================================
 
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+            core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
+        
         nvtx_range_push(suffix="core_attention")
+
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
                 query,
@@ -764,7 +780,12 @@ class Attention(MegatronModule, ABC):
                     block_table,
                 )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
-
+        #0731 增加   
+        if debug and core_attn_out is not None:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if rank in [0, 1]:
+                print(f"  CORE: {core_attn_out.sum().item():.6f}")
+        
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
@@ -780,7 +801,24 @@ class Attention(MegatronModule, ABC):
         nvtx_range_push(suffix="linear_proj")
         output, bias = self.linear_proj(core_attn_out)
         nvtx_range_pop(suffix="linear_proj")
-
+        #0731 增加
+        from megatron.core import mpu
+        
+        if mpu.get_tensor_model_parallel_rank() in [0, 1]:  # 只在前两个rank打印
+            print(f"\n[ATTENTION OUTPUT] Rank {mpu.get_tensor_model_parallel_rank()}")
+            print(f"  TP World Size: {mpu.get_tensor_model_parallel_world_size()}")
+            print(f"  Output shape: {output.shape}")
+            print(f"  Output sum: {output.sum().item():.6f}")
+            print(f"  Output mean: {output.mean().item():.6f}")
+            print(f"  Output std: {output.std().item():.6f}")
+            
+            # 打印第一个样本的前几个值
+            print(f"  First sample values: {output[0, 0, :5].tolist()}")
+            
+            # 如果是张量并行，需要检查是否需要AllReduce
+            if mpu.get_tensor_model_parallel_world_size() > 1:
+                print(f"  This is tensor parallel mode with size {mpu.get_tensor_model_parallel_world_size()}")
+        
         return output, bias
 
 

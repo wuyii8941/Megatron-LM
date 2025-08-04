@@ -229,4 +229,12 @@ def vocab_parallel_cross_entropy(vocab_parallel_logits, target, label_smoothing=
         label_smoothing: smoothing factor, must be in range [0.0, 1.0)
                          default is no smoothing (=0.0)
     """
+    #0728添加
+    import torch.distributed as dist
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    
+    print(f"[DEBUG] Rank {rank} vocab_parallel_CE start: logits_shape={vocab_parallel_logits.shape}, target_unique_count={target.unique().shape[0]}")
+    
+    print(f"[DEBUG] CE input hash: logits={hash(vocab_parallel_logits.data_ptr())}, target={hash(target.data_ptr())}, logits_sum={vocab_parallel_logits.sum().item():.6f}")
+
     return _VocabParallelCrossEntropy.apply(vocab_parallel_logits, target, label_smoothing)

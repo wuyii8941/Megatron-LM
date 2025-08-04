@@ -132,6 +132,53 @@ stimer = StragglerDetector()
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 
+#0803添加
+class DeterministicDataIterator:
+    """确定性数据迭代器，所有rank使用相同的数据"""
+    def __init__(self, data_iterator):
+        self.data_iterator = data_iterator
+        self.cached_batches = []
+        self.current_idx = 0
+        self.debug = os.environ.get('MEGATRON_DEBUG_DETERMINISTIC', '0') == '1'
+        
+    def __iter__(self):
+        return self
+        
+    def __next__(self):
+        if not self.debug:
+            # 非调试模式，直接返回原始数据
+            return next(self.data_iterator)
+            
+        # 调试模式
+        import torch
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        
+        # 如果是rank 0且缓存中没有当前批次，则生成并缓存
+        if rank == 0 and self.current_idx >= len(self.cached_batches):
+            batch = next(self.data_iterator)
+            self.cached_batches.append(batch)
+            if self.current_idx == 0:
+                print(f"[DEBUG] Caching batch {self.current_idx}, text shape: {batch['text'].shape}")
+        
+        # 确保所有rank同步
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        
+        # 从rank 0广播批次索引
+        if torch.distributed.is_initialized():
+            idx_tensor = torch.tensor([self.current_idx], dtype=torch.long, device='cuda')
+            torch.distributed.broadcast(idx_tensor, src=0)
+            self.current_idx = idx_tensor.item()
+        
+        # 返回缓存的批次
+        if self.current_idx < len(self.cached_batches):
+            batch = self.cached_batches[self.current_idx]
+        else:
+            # 非rank 0返回空数据，等待广播
+            batch = None
+            
+        self.current_idx += 1
+        return batch
 
 def destroy_global_state():
     destroy_global_vars()
@@ -2218,12 +2265,16 @@ def train(
 
     # Run training iterations till done.
     while iteration < args.train_iters:
-        if args.profile and torch.distributed.get_rank() in args.profile_ranks:
-            if args.use_pytorch_profiler:
-                prof.step()
-            elif iteration == args.profile_step_start:
-                torch.cuda.cudart().cudaProfilerStart()
-                torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
+        #0728增加
+        # if iteration == 1:  # 只运行第一个iteration
+        #     print("\n========== DEBUG: Running only first iteration ==========")
+        
+        # if args.profile and torch.distributed.get_rank() in args.profile_ranks:
+        #     if args.use_pytorch_profiler:
+        #         prof.step()
+        #     elif iteration == args.profile_step_start:
+        #         torch.cuda.cudart().cudaProfilerStart()
+        #         torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
 
         ft_integration.on_checkpointing_start()
         maybe_finalize_async_save(blocking=False)
@@ -2309,7 +2360,26 @@ def train(
                     enable_forward_pre_hook(model)
                     config.param_sync_func = param_sync_func
                     pre_hook_enabled = True
-
+        #0728新增
+        # 在第一步后打印详细信息并退出
+        if iteration == 1:
+            print(f"\n========== First Step Complete ==========")
+            print(f"Loss dict: {loss_dict}")
+            print(f"Grad norm: {grad_norm}")
+            print(f"Skipped: {skipped_iter}")
+            
+            # 打印一些参数的梯度
+            for name, param in model[0].named_parameters():
+                if param.grad is not None and 'word_embeddings' in name:
+                    print(f"\nParameter: {name}")
+                    print(f"Grad shape: {param.grad.shape}")
+                    print(f"Grad sample: {param.grad.view(-1)[:5]}")
+                    print(f"Grad mean: {param.grad.mean().item()}")
+                    break
+            
+            print("\n========== Exiting after first step ==========")
+            import sys
+            sys.exit(0)
         iteration += 1
         batch_size = (
             mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
@@ -2791,14 +2861,23 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
                 return RerunDataIterator(dataloader)
         else:
             raise RuntimeError("unexpected dataloader type")
-
+    #0803修改
     if train_dataloader is not None:
-        train_data_iterator = _get_iterator(dl_type, train_dataloader)
+        train_data_iterator = iter(train_dataloader) if dl_type == 'single' \
+                              else iter(cyclic_iter(train_dataloader))
+        # 添加调试包装器
+        if os.environ.get('MEGATRON_DEBUG_DETERMINISTIC', '0') == '1':
+            print("[DEBUG] Wrapping train data iterator for deterministic mode")
+            train_data_iterator = DeterministicDataIterator(train_data_iterator)
     else:
         train_data_iterator = None
-
+    #0803修改
     if valid_dataloader is not None:
-        valid_data_iterator = _get_iterator(dl_type, valid_dataloader)
+        valid_data_iterator = iter(valid_dataloader) if dl_type == 'single' \
+                              else iter(cyclic_iter(valid_dataloader))
+        # 添加调试包装器
+        if os.environ.get('MEGATRON_DEBUG_DETERMINISTIC', '0') == '1':
+            valid_data_iterator = DeterministicDataIterator(valid_data_iterator)
     else:
         valid_data_iterator = None
 

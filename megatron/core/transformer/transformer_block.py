@@ -580,6 +580,11 @@ class TransformerBlock(MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                         )
+                    # 0728增加
+                    if l_no == 0:
+                        import torch.distributed as dist
+                        rank = dist.get_rank() if dist.is_initialized() else 0
+                        print(f"[DEBUG] Rank {rank} after layer 0: hidden_sum={hidden_states.sum().item():.6f}, shape={hidden_states.shape}")
 
                     if (
                         torch.is_grad_enabled()

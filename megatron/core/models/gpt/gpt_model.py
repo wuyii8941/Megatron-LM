@@ -225,6 +225,10 @@ class GPTModel(LanguageModule):
             if hasattr(module, 'finish_init'):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
+        
+        #0728添加
+        first_param = next(self.parameters())
+        print(f"[DEBUG] Model init check: first_param_sum={first_param.sum().item():.6f}, shape={first_param.shape}")
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
@@ -355,7 +359,19 @@ class GPTModel(LanguageModule):
             runtime_gather_output (bool): Gather output at runtime. Default None means
                 `parallel_output` arg in the constructor will be used.
         """
-
+        
+        #0728添加
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        
+        print(f"\n[RANK {rank}] === GPTModel Forward Debug ===")
+        print(f"[RANK {rank}] Input shape: {input_ids.shape}")
+        print(f"[RANK {rank}] World size: {world_size}")
+        if labels is not None:
+            print(f"[RANK {rank}] Labels shape: {labels.shape}")
+            print(f"[RANK {rank}] First 10 labels: {labels[0, :10] if labels.numel() > 0 else 'empty'}")
+        
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset = (
@@ -380,7 +396,7 @@ class GPTModel(LanguageModule):
             sequence_len_offset=sequence_len_offset,
             **(extra_block_kwargs or {}),
         )
-
+        
         return self._postprocess(
             hidden_states=hidden_states,
             input_ids=input_ids,
@@ -426,6 +442,17 @@ class GPTModel(LanguageModule):
         Applies Multi-Token Prediction if enabled, generates output logits through
         the output layer, and computes language model loss when labels are provided.
         """
+        #0728添加
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        
+        # 添加：导入并行状态工具
+        from megatron.core import mpu
+        tp_size = mpu.get_tensor_model_parallel_world_size() if mpu.is_initialized() else 1
+        
+        print(f"\n[RANK {rank}] === GPTModel _postprocess Debug ===")
+        print(f"[RANK {rank}] Hidden states shape: {hidden_states.shape}")
+    
         # logits and loss
         output_weight = None
         if self.share_embeddings_and_output_weights:
@@ -470,6 +497,9 @@ class GPTModel(LanguageModule):
                 hidden_states = inference_context.last_token_logits(
                     hidden_states.squeeze(1).unsqueeze(0)
                 ).unsqueeze(1)
+                
+        #0728添加
+        print(f"[DEBUG] Rank {rank} before output_layer: hidden_sum={hidden_states.sum().item():.6f}, TP_size={tp_size}")
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
@@ -485,12 +515,21 @@ class GPTModel(LanguageModule):
                 }
             )
             log_config_to_disk(self.config, payload, prefix='input_and_logits')
+        # 0728添加
+        print(f"[RANK {rank}] Logits shape after output_layer: {logits.shape}")
+        print(f"[RANK {rank}] Logits sample: {logits[0, 0, :5]}")
+        print(f"[DEBUG] Rank {rank} after output_layer: logits_sum={logits.sum().item():.6f}, vocab_size={logits.shape[-1]}")
+
 
         if labels is None:
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
-
+        #0728添加
+        print(f"[DEBUG] Rank {rank} before loss: labels_max={labels.max().item()}, labels_min={labels.min().item()}")
+    
         loss = self.compute_language_model_loss(labels, logits)
+        #0728添加
+        print(f"[RANK {rank}] Loss computed: {loss}")
 
         return loss
 

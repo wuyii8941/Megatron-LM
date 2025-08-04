@@ -439,7 +439,25 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
         hidden_states, context = self._forward_attention(*args, **kwargs)
+        # 0731增加
+        if hasattr(self, 'layer_number') and self.layer_number == 0:
+            if torch.distributed.get_rank() in [0, 1]:
+                print(f"After attention sum: {hidden_states.sum().item():.6f}")
+                print(f"After attention mean: {hidden_states.mean().item():.6f}")
+                print(f"After attention std: {hidden_states.std().item():.6f}")
+                print(f"After attention[0,0,:5]: {hidden_states[0, 0, :5].tolist()}")
+    
         output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
+
+        # 0731增加
+        if hasattr(self, 'layer_number') and self.layer_number == 0:
+            if torch.distributed.get_rank() in [0, 1]:
+                print(f"After MLP sum: {output.sum().item():.6f}")
+                print(f"After MLP mean: {output.mean().item():.6f}")
+                print(f"After MLP std: {output.std().item():.6f}")
+                print(f"After MLP[0,0,:5]: {output[0, 0, :5].tolist()}")
+                print(f"[TRANSFORMER_LAYER DEBUG END] Layer {self.layer_number}\n")
+    
         return output, context
 
     def _forward_attention(
@@ -481,7 +499,13 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 context (Tensor): Updated context tensor if cross-attention is used,
                 otherwise None.
         """
-
+        # 0731 增加
+        if hasattr(self, 'layer_number') and self.layer_number == 0:
+            if torch.distributed.get_rank() in [0, 1]:
+                print(f"\n[ATTENTION DETAIL] Rank {torch.distributed.get_rank()} Layer {self.layer_number}")
+                print(f"  Input hidden_states sum: {hidden_states.sum().item():.6f}")
+                print(f"  Input hidden_states shape: {hidden_states.shape}")
+        
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # Residual connection.
@@ -495,9 +519,24 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             )
         else:
             input_layernorm_output = self.input_layernorm(hidden_states)
-
+    
+        # 0731增加
+        if hasattr(self, 'layer_number') and self.layer_number == 0:
+            if torch.distributed.get_rank() in [0, 1]:
+                print(f"  After LayerNorm sum: {input_layernorm_output.sum().item():.6f}")
+                print(f"  LayerNorm weight sum: {self.input_layernorm.weight.sum().item():.6f}")
+                print(f"  LayerNorm bias sum: {self.input_layernorm.bias.sum().item():.6f}")
+        
         # Self attention.
         nvtx_range_push(suffix="self_attention")
+        # 0731增加
+        if hasattr(self, 'layer_number') and self.layer_number == 0:
+            if torch.distributed.get_rank() in [0, 1]:
+                if hasattr(self.self_attention, 'linear_qkv'):
+                    print(f"  QKV weight shape: {self.self_attention.linear_qkv.weight.shape}")
+                    print(f"  QKV weight sum: {self.self_attention.linear_qkv.weight.sum().item():.6f}")
+                    print(f"  QKV weight[0,:5]: {self.self_attention.linear_qkv.weight[0,:5].tolist()}")
+        
         attention_output_with_bias = self.self_attention(
             input_layernorm_output,
             attention_mask=attention_mask,
@@ -510,7 +549,16 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             sequence_len_offset=sequence_len_offset,
         )
         nvtx_range_pop(suffix="self_attention")
-
+        # 0731增加
+        if hasattr(self, 'layer_number') and self.layer_number == 0:
+            if torch.distributed.get_rank() in [0, 1]:
+                # attention_output_with_bias可能是tuple
+                if isinstance(attention_output_with_bias, tuple):
+                    attention_output = attention_output_with_bias[0]
+                    print(f"  After Self-Attention sum: {attention_output.sum().item():.6f}")
+                else:
+                    print(f"  After Self-Attention sum: {attention_output_with_bias.sum().item():.6f}")
+        
         if self.recompute_input_layernorm:
             # discard the output of the input layernorm and register the recompute
             # as a gradient hook of attention_output_with_bias[0]
@@ -526,13 +574,24 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 attention_output_with_bias, residual, self.hidden_dropout
             )
         nvtx_range_pop(suffix="self_attn_bda")
-
+        #0731增加
+        if hasattr(self, 'layer_number') and self.layer_number == 0:
+            if torch.distributed.get_rank() in [0, 1]:
+                print(f"  After residual+dropout sum: {hidden_states.sum().item():.6f}")
+        
         # Residual connection.
         residual = hidden_states
 
         # Optional Layer norm after self-attention
         pre_cross_attn_layernorm_output = self.pre_cross_attn_layernorm(hidden_states)
-
+        #0731增加
+        if hasattr(self, 'layer_number') and self.layer_number == 0:
+            if torch.distributed.get_rank() in [0, 1]:
+                if self.cross_attention is not None:
+                    print(f"  Has cross-attention: True")
+                else:
+                    print(f"  Has cross-attention: False")
+        
         # Cross attention.
         attention_output_with_bias = self.cross_attention(
             pre_cross_attn_layernorm_output,

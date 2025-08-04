@@ -80,6 +80,13 @@ class LanguageModule(MegatronModule):
             Tensor: Loss tensor of dimensions [batch size, sequence_length]
         """
         # [b s] => [s b]
+        #0728 添加
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        
+        print(f"\n[RANK {rank}] === compute_language_model_loss Debug ===")
+        print(f"[RANK {rank}] Logits shape: {logits.shape}, dtype: {logits.dtype}")
+        print(f"[RANK {rank}] Labels shape: {labels.shape}, dtype: {labels.dtype}")
         labels = labels.transpose(0, 1).contiguous()
         if self.config.cross_entropy_loss_fusion:
             if self.config.cross_entropy_fusion_impl == 'te':
@@ -99,6 +106,12 @@ class LanguageModule(MegatronModule):
 
         # [s b] => [b, s]
         loss = loss.transpose(0, 1).contiguous()
+        
+        #0728 添加
+        print(f"[RANK {rank}] Raw losses shape: {loss.shape}")
+        print(f"[RANK {rank}] Raw losses first 10: {loss[:10]}")
+        print(f"[RANK {rank}] Raw losses mean: {loss.mean().item()}")
+        
         return loss
 
     def setup_embeddings_and_output_layer(self) -> None:
