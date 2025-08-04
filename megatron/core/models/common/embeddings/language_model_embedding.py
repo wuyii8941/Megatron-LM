@@ -108,13 +108,21 @@ class LanguageModelEmbedding(MegatronModule):
         Returns:
             Tensor: The output embeddings
         """
+        # 0803增加
+        from megatron.core import parallel_state
+        rank = parallel_state.get_data_parallel_rank() if torch.distributed.is_initialized() else 0
+        
         word_embeddings = self.word_embeddings(input_ids)
+        # 0803增加调试点1：检查word embedding输出和特定token
+        print(f"[EMBED] Rank {rank}: word_emb_sum={word_embeddings.sum().item():.4f}, "
+            f"token[0,0]={input_ids[0,0].item()}, "
+            f"emb[0,0,:3]={word_embeddings[0,0,:3].tolist()}")
+
         if self.add_position_embedding:
             position_embeddings = self.position_embeddings(position_ids)
             embeddings = word_embeddings + position_embeddings
         else:
             embeddings = word_embeddings
-
         if not self.reduce_scatter_embeddings:
             # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
             embeddings = embeddings.transpose(0, 1).contiguous()
@@ -130,7 +138,9 @@ class LanguageModelEmbedding(MegatronModule):
         # If the input flag for fp32 residual connection is set, convert for float.
         if self.config.fp32_residual_connection:
             embeddings = embeddings.float()
-
+        # 0803增加 
+        print(f"[EMBED] Rank {rank}: before_dropout_sum={embeddings.sum().item():.4f}")
+        
         # Dropout.
         if self.config.sequence_parallel:
             if not self.reduce_scatter_embeddings and self.scatter_to_sequence_parallel:
@@ -146,5 +156,9 @@ class LanguageModelEmbedding(MegatronModule):
                 embeddings = self.embedding_dropout(embeddings)
         else:
             embeddings = self.embedding_dropout(embeddings)
-
+            
+        #0803 增加
+        print(f"[EMBED] Rank {rank}: after_dropout_sum={embeddings.sum().item():.4f}, "
+            f"dropout_rate={self.config.hidden_dropout}")
+    
         return embeddings

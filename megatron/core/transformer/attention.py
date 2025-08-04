@@ -28,6 +28,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
     deprecate_inference_params,
     divide,
+    get_pg_size,
     is_fa_min_version,
     nvtx_range_pop,
     nvtx_range_push,
@@ -135,7 +136,7 @@ class Attention(MegatronModule, ABC):
         self.model_comm_pgs = model_comm_pgs
 
         # Per attention head and per partition values
-        world_size = self.model_comm_pgs.tp.size()
+        world_size = get_pg_size(self.model_comm_pgs.tp)
         self.hidden_size_per_attention_head = divide(
             self.query_projection_size, self.config.num_attention_heads
         )
@@ -443,7 +444,6 @@ class Attention(MegatronModule, ABC):
         cu_seqlens_q,
         cu_seqlens_k,
         seqlens_k,
-        seqlens_k_decode_only,
         block_table,
     ) -> Tensor:
         """Flash attention kernel for mixed decode and prefill samples.
@@ -457,7 +457,6 @@ class Attention(MegatronModule, ABC):
             cu_seqlens_q (Tensor): Cumulative query sequence lengths.
             cu_seqlens_k (Tensor): Cumulative key sequence lengths.
             seqlens_k (Tensor): key sequence lengths.
-            seqlens_k_decode_only (Tensor): key sequence lengths (decode_only).
             block_table (Tensor): KV cache chunk ids for all samples.
         Return:
             (Tensor) Attention output.
@@ -525,7 +524,7 @@ class Attention(MegatronModule, ABC):
                 "q": q,
                 "k_cache": k,
                 "v_cache": v,
-                "cache_seqlens": seqlens_k_decode_only,
+                "cache_seqlens": seqlens_k,
                 "causal": True,
                 "page_table" if HAVE_FA3 else "block_table": block_table,
             }
@@ -579,6 +578,13 @@ class Attention(MegatronModule, ABC):
         )
         if no_rope:
             rotary_pos_emb = None
+        #0731 增加
+        debug = hasattr(self, 'layer_number') and self.layer_number == 1
+        if debug:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if rank in [0, 1]:
+                print(f"\n[ATTN L{self.layer_number}] Rank {rank}")
+                print(f"  IN: {hidden_states.sum().item():.6f}")
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -605,6 +611,11 @@ class Attention(MegatronModule, ABC):
         nvtx_range_push(suffix="qkv")
         query, key, value = self.get_query_key_value_tensors(hidden_states, key_value_states)
         nvtx_range_pop(suffix="qkv")
+        # 调试QKV
+        if debug:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if rank in [0, 1]:
+                print(f"  QKV: Q={query.sum().item():.6f}, K={key.sum().item():.6f}, V={value.sum().item():.6f}")
 
         # ===================================================
         # Adjust key, value, and rotary_pos_emb for inference
@@ -644,6 +655,7 @@ class Attention(MegatronModule, ABC):
         if (
             in_decode_mode
             and self.config.enable_cuda_graph
+            and self.config.cuda_graph_scope != "full_iteration"
             and inference_context.is_static_batching()
         ):
             raise ValueError(f"CUDA graphs must use flash decode with static batching!")
@@ -719,7 +731,11 @@ class Attention(MegatronModule, ABC):
         # core attention computation
         # ==================================
 
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+            core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
+        
         nvtx_range_push(suffix="core_attention")
+
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
                 query,
@@ -747,9 +763,7 @@ class Attention(MegatronModule, ABC):
                 # Dynamic batching attention kernel.
                 q, k, v = (query, key, value)
                 cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
-                cu_kv_lengths, kv_lengths, kv_lengths_decode_only, max_seqlen_k = (
-                    inference_context.cu_kv_lengths()
-                )
+                cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
 
                 core_attn_out = self.flash_decode_and_prefill(
                     q,
@@ -760,11 +774,15 @@ class Attention(MegatronModule, ABC):
                     cu_query_lengths,
                     cu_kv_lengths,
                     kv_lengths,
-                    kv_lengths_decode_only,
                     block_table,
                 )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
-
+        #0731 增加   
+        if debug and core_attn_out is not None:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if rank in [0, 1]:
+                print(f"  CORE: {core_attn_out.sum().item():.6f}")
+        
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
@@ -780,7 +798,24 @@ class Attention(MegatronModule, ABC):
         nvtx_range_push(suffix="linear_proj")
         output, bias = self.linear_proj(core_attn_out)
         nvtx_range_pop(suffix="linear_proj")
-
+        #0731 增加
+        from megatron.core import mpu
+        
+        if mpu.get_tensor_model_parallel_rank() in [0, 1]:  # 只在前两个rank打印
+            print(f"\n[ATTENTION OUTPUT] Rank {mpu.get_tensor_model_parallel_rank()}")
+            print(f"  TP World Size: {mpu.get_tensor_model_parallel_world_size()}")
+            print(f"  Output shape: {output.shape}")
+            print(f"  Output sum: {output.sum().item():.6f}")
+            print(f"  Output mean: {output.mean().item():.6f}")
+            print(f"  Output std: {output.std().item():.6f}")
+            
+            # 打印第一个样本的前几个值
+            print(f"  First sample values: {output[0, 0, :5].tolist()}")
+            
+            # 如果是张量并行，需要检查是否需要AllReduce
+            if mpu.get_tensor_model_parallel_world_size() > 1:
+                print(f"  This is tensor parallel mode with size {mpu.get_tensor_model_parallel_world_size()}")
+        
         return output, bias
 
 
